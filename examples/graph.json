@@ -1,0 +1,21 @@
+{
+  "entities": [
+    { "name": "Acme Corp", "type": "Organization" },
+    { "name": "billing-service", "type": "Service", "attributes": { "tier": "1" } },
+    { "name": "auth-service", "type": "Service", "attributes": { "tier": "0" } },
+    { "name": "postgres", "type": "Service" },
+    { "name": "object-storage", "type": "Service" },
+    { "name": "auth-image-v1", "type": "Artifact" },
+    { "name": "auth-image-v2", "type": "Artifact" },
+    { "name": "on-call rotation", "type": { "Custom": "Process" } }
+  ],
+  "relations": [
+    { "source": "billing-service", "target": "auth-service", "relation": "DependsOn", "weight": 0.9 },
+    { "source": "auth-service", "target": "postgres", "relation": "DependsOn", "weight": 0.8 },
+    { "source": "postgres", "target": "object-storage", "relation": "DependsOn", "weight": 0.5 },
+    { "source": "Acme Corp", "target": "billing-service", "relation": "Contains" },
+    { "source": "Acme Corp", "target": "auth-service", "relation": "Contains" },
+    { "source": "auth-image-v2", "target": "auth-image-v1", "relation": "Supersedes" },
+    { "source": "auth-image-v2", "target": "Acme Corp", "relation": "ProducedBy" }
+  ]
+}

@@ -1,0 +1,20 @@
+[
+  {
+    "source_entity": "billing-service",
+    "target_entity": "postgres",
+    "relation": "DependsOn",
+    "citation": { "document_id": "architecture.md", "chunk_id": "c-04" }
+  },
+  {
+    "source_entity": "auth-image-v2",
+    "target_entity": "auth-image-v1",
+    "relation": "Supersedes",
+    "citation": { "document_id": "release-notes.md", "chunk_id": "c-11" }
+  },
+  {
+    "source_entity": "postgres",
+    "target_entity": "billing-service",
+    "relation": "DependsOn",
+    "citation": { "document_id": "architecture.md", "chunk_id": "c-09" }
+  }
+]
