@@ -8,6 +8,7 @@
 //! * [`vector`] - SIMD dot/cosine kernels and a contiguous dense vector store.
 //! * [`lexical`] - tokenizer and BM25 inverted index.
 //! * [`retrieval`] - hybrid search: k-NN + BM25, rank fusion, graph expansion.
+//! * [`server`] - multi-tenant HTTP/SSE service over all of the above.
 //! * [`error`] - [`NexusError`], the error type of the retrieval layers.
 
 #![deny(
@@ -22,6 +23,7 @@ pub mod graph;
 pub mod lexical;
 pub mod models;
 pub mod retrieval;
+pub mod server;
 pub mod storage;
 mod topk;
 pub mod vector;

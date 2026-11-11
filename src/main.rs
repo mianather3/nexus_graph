@@ -9,16 +9,19 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
+use nexus_graph::server::dto::{EntityInput, RelationInput};
+use nexus_graph::server::{self, ServerConfig};
 use nexus_graph::{
-    load_snapshot, save_snapshot, verify_claims, Attributes, EntityId, EntityType, GraphClaim,
-    HybridQuery, HybridRetriever, Kernel, KnowledgeGraph, RelationType, RetrievalBundle,
-    RetrievalConfig, VerifierConfig,
+    load_snapshot, save_snapshot, verify_claims, EntityId, GraphClaim, HybridQuery,
+    HybridRetriever, Kernel, KnowledgeGraph, RetrievalBundle, RetrievalConfig, VerifierConfig,
 };
 
 const USAGE: &str = "\
@@ -38,6 +41,8 @@ USAGE:
         BM25 text search over entity names, types and attributes.
     nexus_graph hybrid <snapshot> [OPTIONS]
         Hybrid vector + text search with rank fusion and graph expansion.
+    nexus_graph serve --bind <addr> --snapshot-dir <path> [OPTIONS]
+        Run the multi-tenant HTTP API (see SERVE OPTIONS).
 
 HYBRID OPTIONS (at least one of --text, --vector, --like is required):
     --text <query>          Text query for the BM25 channel
@@ -49,6 +54,13 @@ HYBRID OPTIONS (at least one of --text, --vector, --like is required):
     --vector-weight <w>     RRF weight of the vector channel   [default: 1]
     --lexical-weight <w>    RRF weight of the lexical channel  [default: 1]
     --json                  Print the full result bundle as JSON
+
+SERVE OPTIONS:
+    --bind <addr>           Socket address to listen on, e.g. 127.0.0.1:8080
+    --snapshot-dir <path>   Directory of per-namespace snapshots (created if missing)
+    --queue-capacity <n>    Ingestion jobs queued per namespace before 429  [default: 64]
+    --timeout-secs <n>      Time allowed to produce a response              [default: 30]
+    --cors-origin <origin>  Browser origin allowed to call the API (repeatable)
 ";
 
 /// JSON input of `ingest`. Relations refer to entities by canonical name.
@@ -57,32 +69,6 @@ struct GraphDocument {
     entities: Vec<EntityInput>,
     #[serde(default)]
     relations: Vec<RelationInput>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EntityInput {
-    name: String,
-    #[serde(rename = "type")]
-    entity_type: EntityType,
-    #[serde(default)]
-    attributes: Attributes,
-    #[serde(default)]
-    embedding: Option<Vec<f32>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RelationInput {
-    source: String,
-    target: String,
-    relation: RelationType,
-    #[serde(default = "full_confidence")]
-    weight: f32,
-    #[serde(default)]
-    metadata: Attributes,
-}
-
-fn full_confidence() -> f32 {
-    1.0
 }
 
 fn main() -> ExitCode {
@@ -110,6 +96,7 @@ fn run(args: &[String]) -> Result<ExitCode> {
         ["search", snapshot, query] => search(snapshot, query, RetrievalConfig::default().top_k),
         ["search", snapshot, query, top_k] => search(snapshot, query, parse_value("top_k", top_k)?),
         ["hybrid", snapshot, options @ ..] => hybrid(snapshot, options),
+        ["serve", options @ ..] => serve(options),
         [] | ["help" | "--help" | "-h"] => {
             print!("{USAGE}");
             Ok(ExitCode::SUCCESS)
@@ -336,4 +323,54 @@ fn print_context(bundle: &RetrievalBundle, hops: usize) {
             edge.weight
         );
     }
+}
+
+fn serve(options: &[&str]) -> Result<ExitCode> {
+    let mut bind: Option<SocketAddr> = None;
+    let mut snapshot_dir: Option<&str> = None;
+    let mut queue_capacity: Option<usize> = None;
+    let mut timeout_secs: Option<u64> = None;
+    let mut cors_origins: Vec<String> = Vec::new();
+
+    let mut remaining = options.iter().copied();
+    while let Some(flag) = remaining.next() {
+        let value = remaining
+            .next()
+            .ok_or_else(|| anyhow!("missing value for `{flag}`"))?;
+        match flag {
+            "--bind" => bind = Some(parse_value(flag, value)?),
+            "--snapshot-dir" => snapshot_dir = Some(value),
+            "--queue-capacity" => queue_capacity = Some(parse_value(flag, value)?),
+            "--timeout-secs" => timeout_secs = Some(parse_value(flag, value)?),
+            "--cors-origin" => cors_origins.push(value.to_owned()),
+            _ => bail!("unknown option `{flag}`\n\n{USAGE}"),
+        }
+    }
+    let bind = bind.ok_or_else(|| anyhow!("`serve` requires --bind <addr>"))?;
+    let snapshot_dir =
+        snapshot_dir.ok_or_else(|| anyhow!("`serve` requires --snapshot-dir <path>"))?;
+
+    let mut config = ServerConfig::new(snapshot_dir);
+    if let Some(capacity) = queue_capacity {
+        if capacity == 0 {
+            bail!("--queue-capacity must be at least 1");
+        }
+        config.ingest_queue_capacity = capacity;
+    }
+    if let Some(secs) = timeout_secs {
+        config.request_timeout = Duration::from_secs(secs);
+    }
+    config.cors_allowed_origins = cors_origins;
+
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(std::io::stderr)
+        .init();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the async runtime")?
+        .block_on(server::serve(bind, config))
+        .with_context(|| format!("serving on {bind}"))?;
+    Ok(ExitCode::SUCCESS)
 }
