@@ -1,18 +1,28 @@
 //! `nexus_graph` command-line interface.
 
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
+use std::collections::HashMap;
 use std::fs;
 use std::process::ExitCode;
+use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
 use nexus_graph::{
-    load_snapshot, save_snapshot, verify_claims, Attributes, EntityType, GraphClaim,
-    KnowledgeGraph, RelationType, VerifierConfig,
+    load_snapshot, save_snapshot, verify_claims, Attributes, EntityId, EntityType, GraphClaim,
+    HybridQuery, HybridRetriever, Kernel, KnowledgeGraph, RelationType, RetrievalBundle,
+    RetrievalConfig, VerifierConfig,
 };
 
 const USAGE: &str = "\
-NexusGraph - hybrid knowledge graph with deterministic claim verification
+NexusGraph - hybrid knowledge graph retrieval with deterministic claim verification
 
 USAGE:
     nexus_graph ingest <graph.json> <snapshot>
@@ -22,6 +32,23 @@ USAGE:
     nexus_graph verify <snapshot> <claims.json> [max_hops]
         Verify a JSON array of claims and print the report as JSON.
         Exits with status 2 if any claim is rejected.
+    nexus_graph index <snapshot>
+        Build the vector and lexical indices and print their statistics.
+    nexus_graph search <snapshot> <query> [top_k]
+        BM25 text search over entity names, types and attributes.
+    nexus_graph hybrid <snapshot> [OPTIONS]
+        Hybrid vector + text search with rank fusion and graph expansion.
+
+HYBRID OPTIONS (at least one of --text, --vector, --like is required):
+    --text <query>          Text query for the BM25 channel
+    --vector <f,f,...>      Query embedding, comma-separated
+    --like <entity>         Use the embedding of this entity as the query
+    --top-k <n>             Fused results to return            [default: 10]
+    --hops <n>              Graph expansion depth              [default: 1]
+    --rrf-k <x>             RRF smoothing constant             [default: 60]
+    --vector-weight <w>     RRF weight of the vector channel   [default: 1]
+    --lexical-weight <w>    RRF weight of the lexical channel  [default: 1]
+    --json                  Print the full result bundle as JSON
 ";
 
 /// JSON input of `ingest`. Relations refer to entities by canonical name.
@@ -76,17 +103,28 @@ fn run(args: &[String]) -> Result<ExitCode> {
         ["stats", snapshot] => stats(snapshot),
         ["verify", snapshot, claims] => verify(snapshot, claims, VerifierConfig::default()),
         ["verify", snapshot, claims, max_hops] => {
-            let max_hops = max_hops
-                .parse()
-                .with_context(|| format!("invalid max_hops `{max_hops}`"))?;
+            let max_hops = parse_value("max_hops", max_hops)?;
             verify(snapshot, claims, VerifierConfig { max_hops })
         }
+        ["index", snapshot] => index(snapshot),
+        ["search", snapshot, query] => search(snapshot, query, RetrievalConfig::default().top_k),
+        ["search", snapshot, query, top_k] => search(snapshot, query, parse_value("top_k", top_k)?),
+        ["hybrid", snapshot, options @ ..] => hybrid(snapshot, options),
         [] | ["help" | "--help" | "-h"] => {
             print!("{USAGE}");
             Ok(ExitCode::SUCCESS)
         }
         _ => bail!("unrecognized arguments\n\n{USAGE}"),
     }
+}
+
+fn parse_value<T>(name: &str, raw: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    raw.parse()
+        .with_context(|| format!("invalid value `{raw}` for {name}"))
 }
 
 fn ingest(input: &str, snapshot: &str) -> Result<ExitCode> {
@@ -153,4 +191,149 @@ fn verify(snapshot: &str, claims_path: &str, config: VerifierConfig) -> Result<E
     } else {
         ExitCode::from(2)
     })
+}
+
+fn load_retriever(snapshot: &str, config: RetrievalConfig) -> Result<HybridRetriever> {
+    let graph = Arc::new(load_snapshot(snapshot)?);
+    HybridRetriever::from_graph(graph, config).context("building retrieval indices")
+}
+
+fn index(snapshot: &str) -> Result<ExitCode> {
+    let retriever = load_retriever(snapshot, RetrievalConfig::default())?;
+    let stats = retriever.stats();
+    println!("documents:      {}", stats.documents);
+    println!("distinct terms: {}", stats.terms);
+    println!("vectors:        {}", stats.vectors);
+    match stats.vector_dim {
+        Some(dim) => println!("vector dim:     {dim}"),
+        None => println!("vector dim:     - (no embeddings)"),
+    }
+    println!("simd kernel:    {}", Kernel::active());
+    Ok(ExitCode::SUCCESS)
+}
+
+fn search(snapshot: &str, query: &str, top_k: usize) -> Result<ExitCode> {
+    let config = RetrievalConfig {
+        top_k,
+        vector_weight: 0.0,
+        expansion_hops: 0,
+        ..RetrievalConfig::default()
+    };
+    let retriever = load_retriever(snapshot, config)?;
+    let bundle = retriever.search(&HybridQuery {
+        text: Some(query),
+        embedding: None,
+    })?;
+    print_hits(&bundle);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn hybrid(snapshot: &str, options: &[&str]) -> Result<ExitCode> {
+    let mut config = RetrievalConfig::default();
+    let mut text: Option<&str> = None;
+    let mut vector: Option<Vec<f32>> = None;
+    let mut like: Option<&str> = None;
+    let mut json = false;
+
+    let mut remaining = options.iter().copied();
+    while let Some(flag) = remaining.next() {
+        if flag == "--json" {
+            json = true;
+            continue;
+        }
+        let value = remaining
+            .next()
+            .ok_or_else(|| anyhow!("missing value for `{flag}`"))?;
+        match flag {
+            "--text" => text = Some(value),
+            "--vector" => {
+                let parsed = value
+                    .split(',')
+                    .map(|component| parse_value("--vector", component.trim()))
+                    .collect::<Result<Vec<f32>>>()?;
+                vector = Some(parsed);
+            }
+            "--like" => like = Some(value),
+            "--top-k" => config.top_k = parse_value(flag, value)?,
+            "--hops" => config.expansion_hops = parse_value(flag, value)?,
+            "--rrf-k" => config.rrf_k = parse_value(flag, value)?,
+            "--vector-weight" => config.vector_weight = parse_value(flag, value)?,
+            "--lexical-weight" => config.lexical_weight = parse_value(flag, value)?,
+            _ => bail!("unknown option `{flag}`\n\n{USAGE}"),
+        }
+    }
+    if vector.is_some() && like.is_some() {
+        bail!("--vector and --like are mutually exclusive");
+    }
+
+    let retriever = load_retriever(snapshot, config)?;
+    if let Some(name) = like {
+        let graph = retriever.graph();
+        let embedding = graph
+            .node_index_by_name(name)
+            .and_then(|node| graph.node(node))
+            .ok_or_else(|| anyhow!("no entity named `{name}`"))?
+            .embedding
+            .ok_or_else(|| anyhow!("entity `{name}` has no embedding"))?;
+        vector = Some(embedding);
+    }
+
+    let bundle = retriever.search(&HybridQuery {
+        text,
+        embedding: vector.as_deref(),
+    })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&bundle)?);
+    } else {
+        print_hits(&bundle);
+        print_context(&bundle, config.expansion_hops);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_hits(bundle: &RetrievalBundle) {
+    if bundle.hits.is_empty() {
+        println!("no results");
+        return;
+    }
+    for (position, hit) in bundle.hits.iter().enumerate() {
+        let vector = hit.vector.map_or_else(String::new, |channel| {
+            format!("  vector #{} cos={:.4}", channel.rank, channel.score)
+        });
+        let lexical = hit.lexical.map_or_else(String::new, |channel| {
+            format!("  lexical #{} bm25={:.4}", channel.rank, channel.score)
+        });
+        let line = format!(
+            "{:>2}. {} ({})  rrf={:.5}{vector}{lexical}",
+            position + 1,
+            hit.name,
+            hit.entity_type,
+            hit.fused_score
+        );
+        println!("{line}");
+    }
+}
+
+fn print_context(bundle: &RetrievalBundle, hops: usize) {
+    let context = &bundle.context;
+    println!(
+        "\ncontext ({hops}-hop): {} entities, {} relations",
+        context.nodes.len(),
+        context.edges.len()
+    );
+    let names: HashMap<EntityId, &str> = context
+        .nodes
+        .iter()
+        .map(|node| (node.entity.id, node.entity.canonical_name.as_str()))
+        .collect();
+    let name_of = |id: EntityId| names.get(&id).copied().unwrap_or("?");
+    for edge in &context.edges {
+        println!(
+            "    {} -[{}]-> {}  ({:.2})",
+            name_of(edge.source),
+            edge.relation,
+            name_of(edge.target),
+            edge.weight
+        );
+    }
 }

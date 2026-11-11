@@ -172,6 +172,11 @@ impl GraphState {
         self.graph.node_weight(index)
     }
 
+    /// All entities, in node-index order.
+    pub fn nodes(&self) -> impl Iterator<Item = &EntityNode> {
+        self.graph.node_weights()
+    }
+
     /// Looks an entity up by canonical name (case- and whitespace-insensitive).
     pub fn node_index_by_name(&self, name: &str) -> Option<NodeIndex> {
         self.name_index.get(&normalize_entity_name(name)).copied()

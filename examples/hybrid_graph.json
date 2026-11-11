@@ -1,0 +1,67 @@
+{
+  "entities": [
+    {
+      "name": "Acme Corp",
+      "type": "Organization",
+      "attributes": { "description": "Parent company operating the payments platform" },
+      "embedding": [0.1, 0.1, 0.1, 0.9]
+    },
+    {
+      "name": "billing-service",
+      "type": "Service",
+      "attributes": { "description": "Generates invoices and charges customer credit cards for subscriptions" },
+      "embedding": [0.9, 0.1, 0.2, 0.1]
+    },
+    {
+      "name": "auth-service",
+      "type": "Service",
+      "attributes": { "description": "Issues login tokens and validates user sessions and passwords" },
+      "embedding": [0.1, 0.9, 0.1, 0.1]
+    },
+    {
+      "name": "postgres",
+      "type": "Service",
+      "attributes": { "description": "Relational database storing user accounts, sessions and invoices" },
+      "embedding": [0.3, 0.4, 0.8, 0.1]
+    },
+    {
+      "name": "object-storage",
+      "type": "Service",
+      "attributes": { "description": "Durable blob storage for database backups and invoice PDFs" },
+      "embedding": [0.2, 0.1, 0.9, 0.2]
+    },
+    {
+      "name": "redis",
+      "type": "Service",
+      "attributes": { "description": "In-memory cache for session tokens and rate limiting" },
+      "embedding": [0.1, 0.7, 0.6, 0.1]
+    },
+    {
+      "name": "auth-image-v2",
+      "type": "Artifact",
+      "attributes": { "description": "Container image of the login service, release two" },
+      "embedding": [0.1, 0.8, 0.1, 0.4]
+    },
+    {
+      "name": "zero-trust",
+      "type": "Concept",
+      "attributes": { "description": "Security model where every request is authenticated, never trusted by network location" },
+      "embedding": [0.0, 0.6, 0.0, 0.7]
+    },
+    {
+      "name": "on-call rotation",
+      "type": { "Custom": "Process" },
+      "attributes": { "description": "Weekly schedule of engineers paged for incidents" }
+    }
+  ],
+  "relations": [
+    { "source": "billing-service", "target": "auth-service", "relation": "DependsOn", "weight": 0.9 },
+    { "source": "billing-service", "target": "postgres", "relation": "DependsOn", "weight": 0.95 },
+    { "source": "auth-service", "target": "postgres", "relation": "DependsOn", "weight": 0.8 },
+    { "source": "auth-service", "target": "redis", "relation": "DependsOn", "weight": 0.9 },
+    { "source": "postgres", "target": "object-storage", "relation": "DependsOn", "weight": 0.5 },
+    { "source": "Acme Corp", "target": "billing-service", "relation": "Contains" },
+    { "source": "Acme Corp", "target": "auth-service", "relation": "Contains" },
+    { "source": "auth-image-v2", "target": "Acme Corp", "relation": "ProducedBy" }
+  ]
+}
