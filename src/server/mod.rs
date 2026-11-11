@@ -160,7 +160,7 @@ pub fn router(manager: Arc<EngineManager>) -> Router {
         .with_state(manager)
 }
 
-/// Binds `addr` and serves until Ctrl-C, then stops accepting connections and
+/// Binds `addr` and serves until SIGINT or SIGTERM, then stops accepting connections and
 /// lets in-flight requests finish.
 pub async fn serve(addr: SocketAddr, config: ServerConfig) -> std::io::Result<()> {
     tokio::fs::create_dir_all(&config.snapshot_dir).await?;
@@ -172,12 +172,34 @@ pub async fn serve(addr: SocketAddr, config: ServerConfig) -> std::io::Result<()
         "nexus_graph listening"
     );
     axum::serve(listener, router(manager))
-        .with_graceful_shutdown(async {
-            // If the signal handler cannot be installed, keep serving.
-            if tokio::signal::ctrl_c().await.is_err() {
-                std::future::pending::<()>().await;
-            }
-            tracing::info!("shutdown signal received");
-        })
+        .with_graceful_shutdown(shutdown_signal())
         .await
+}
+
+/// Resolves on Ctrl-C (SIGINT) or, on Unix, SIGTERM, which is what container
+/// runtimes send on stop. A signal whose handler cannot be installed is
+/// simply never observed.
+async fn shutdown_signal() {
+    let interrupt = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = interrupt => {}
+        () = terminate => {}
+    }
+    tracing::info!("shutdown signal received");
 }

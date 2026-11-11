@@ -266,27 +266,60 @@ mod neon {
     ///
     /// The CPU must support NEON.
     #[target_feature(enable = "neon")]
+    #[allow(clippy::similar_names)] // the a/b pairs are deliberately parallel
     pub(super) unsafe fn dot_and_norms(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
         let len = a.len().min(b.len());
         let (ptr_a, ptr_b) = (a.as_ptr(), b.as_ptr());
         let mut i = 0;
 
+        // Four independent accumulators per sum: a single one would make the
+        // loop wait on the FMA latency of the previous iteration.
+        //
         // SAFETY: NEON is available (function contract). Each `vld1q_f32`
-        // reads `LANES` f32s at offset `i` only while `i + LANES <= len`, and
-        // `len` is within both slices. No alignment requirement.
+        // reads `LANES` f32s starting at offset `i + j * LANES`; the loop
+        // conditions guarantee the last element read is below `len`, which is
+        // within both slices. `vld1q_f32` has no alignment requirement.
         let (dot, norm_a, norm_b) = unsafe {
-            let mut dot = vdupq_n_f32(0.0);
-            let mut norm_a = vdupq_n_f32(0.0);
-            let mut norm_b = vdupq_n_f32(0.0);
+            let zero = vdupq_n_f32(0.0);
+            let (mut dot0, mut dot1, mut dot2, mut dot3) = (zero, zero, zero, zero);
+            let (mut sq_a0, mut sq_a1, mut sq_a2, mut sq_a3) = (zero, zero, zero, zero);
+            let (mut sq_b0, mut sq_b1, mut sq_b2, mut sq_b3) = (zero, zero, zero, zero);
+            while i + 4 * LANES <= len {
+                let va0 = vld1q_f32(ptr_a.add(i));
+                let vb0 = vld1q_f32(ptr_b.add(i));
+                let va1 = vld1q_f32(ptr_a.add(i + LANES));
+                let vb1 = vld1q_f32(ptr_b.add(i + LANES));
+                let va2 = vld1q_f32(ptr_a.add(i + 2 * LANES));
+                let vb2 = vld1q_f32(ptr_b.add(i + 2 * LANES));
+                let va3 = vld1q_f32(ptr_a.add(i + 3 * LANES));
+                let vb3 = vld1q_f32(ptr_b.add(i + 3 * LANES));
+                dot0 = vfmaq_f32(dot0, va0, vb0);
+                dot1 = vfmaq_f32(dot1, va1, vb1);
+                dot2 = vfmaq_f32(dot2, va2, vb2);
+                dot3 = vfmaq_f32(dot3, va3, vb3);
+                sq_a0 = vfmaq_f32(sq_a0, va0, va0);
+                sq_a1 = vfmaq_f32(sq_a1, va1, va1);
+                sq_a2 = vfmaq_f32(sq_a2, va2, va2);
+                sq_a3 = vfmaq_f32(sq_a3, va3, va3);
+                sq_b0 = vfmaq_f32(sq_b0, vb0, vb0);
+                sq_b1 = vfmaq_f32(sq_b1, vb1, vb1);
+                sq_b2 = vfmaq_f32(sq_b2, vb2, vb2);
+                sq_b3 = vfmaq_f32(sq_b3, vb3, vb3);
+                i += 4 * LANES;
+            }
             while i + LANES <= len {
-                let va = vld1q_f32(ptr_a.add(i));
-                let vb = vld1q_f32(ptr_b.add(i));
-                dot = vfmaq_f32(dot, va, vb);
-                norm_a = vfmaq_f32(norm_a, va, va);
-                norm_b = vfmaq_f32(norm_b, vb, vb);
+                let va0 = vld1q_f32(ptr_a.add(i));
+                let vb0 = vld1q_f32(ptr_b.add(i));
+                dot0 = vfmaq_f32(dot0, va0, vb0);
+                sq_a0 = vfmaq_f32(sq_a0, va0, va0);
+                sq_b0 = vfmaq_f32(sq_b0, vb0, vb0);
                 i += LANES;
             }
-            (vaddvq_f32(dot), vaddvq_f32(norm_a), vaddvq_f32(norm_b))
+            (
+                vaddvq_f32(vaddq_f32(vaddq_f32(dot0, dot1), vaddq_f32(dot2, dot3))),
+                vaddvq_f32(vaddq_f32(vaddq_f32(sq_a0, sq_a1), vaddq_f32(sq_a2, sq_a3))),
+                vaddvq_f32(vaddq_f32(vaddq_f32(sq_b0, sq_b1), vaddq_f32(sq_b2, sq_b3))),
+            )
         };
         let (tail_d, tail_a, tail_b) = scalar::tail_dot_and_norms(a, b, i);
         (dot + tail_d, norm_a + tail_a, norm_b + tail_b)
@@ -375,25 +408,42 @@ mod avx2 {
         let mut norm_b_lanes = [0.0_f32; LANES];
 
         // SAFETY: AVX2 and FMA are available (function contract). Each
-        // `_mm256_loadu_ps` reads `LANES` f32s at offset `i` only while
-        // `i + LANES <= len`, and `len` is within both slices. Each
+        // `_mm256_loadu_ps` reads `LANES` f32s starting at offset `i` or
+        // `i + LANES`; the loop conditions guarantee the last element read is
+        // below `len`, which is within both slices. Each
         // `_mm256_storeu_ps` writes exactly `LANES` f32s into an array of
         // `LANES` elements. All are unaligned operations.
         unsafe {
-            let mut dot = _mm256_setzero_ps();
-            let mut norm_a = _mm256_setzero_ps();
-            let mut norm_b = _mm256_setzero_ps();
+            // Two independent accumulators per sum (six FMA chains fit the
+            // sixteen YMM registers together with the four loads), so the
+            // loop is not bound by the FMA latency of a single chain.
+            let (mut dot0, mut dot1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+            let (mut sq_a0, mut sq_a1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+            let (mut sq_b0, mut sq_b1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+            while i + 2 * LANES <= len {
+                let va0 = _mm256_loadu_ps(ptr_a.add(i));
+                let vb0 = _mm256_loadu_ps(ptr_b.add(i));
+                let va1 = _mm256_loadu_ps(ptr_a.add(i + LANES));
+                let vb1 = _mm256_loadu_ps(ptr_b.add(i + LANES));
+                dot0 = _mm256_fmadd_ps(va0, vb0, dot0);
+                dot1 = _mm256_fmadd_ps(va1, vb1, dot1);
+                sq_a0 = _mm256_fmadd_ps(va0, va0, sq_a0);
+                sq_a1 = _mm256_fmadd_ps(va1, va1, sq_a1);
+                sq_b0 = _mm256_fmadd_ps(vb0, vb0, sq_b0);
+                sq_b1 = _mm256_fmadd_ps(vb1, vb1, sq_b1);
+                i += 2 * LANES;
+            }
             while i + LANES <= len {
-                let va = _mm256_loadu_ps(ptr_a.add(i));
-                let vb = _mm256_loadu_ps(ptr_b.add(i));
-                dot = _mm256_fmadd_ps(va, vb, dot);
-                norm_a = _mm256_fmadd_ps(va, va, norm_a);
-                norm_b = _mm256_fmadd_ps(vb, vb, norm_b);
+                let va0 = _mm256_loadu_ps(ptr_a.add(i));
+                let vb0 = _mm256_loadu_ps(ptr_b.add(i));
+                dot0 = _mm256_fmadd_ps(va0, vb0, dot0);
+                sq_a0 = _mm256_fmadd_ps(va0, va0, sq_a0);
+                sq_b0 = _mm256_fmadd_ps(vb0, vb0, sq_b0);
                 i += LANES;
             }
-            _mm256_storeu_ps(dot_lanes.as_mut_ptr(), dot);
-            _mm256_storeu_ps(norm_a_lanes.as_mut_ptr(), norm_a);
-            _mm256_storeu_ps(norm_b_lanes.as_mut_ptr(), norm_b);
+            _mm256_storeu_ps(dot_lanes.as_mut_ptr(), _mm256_add_ps(dot0, dot1));
+            _mm256_storeu_ps(norm_a_lanes.as_mut_ptr(), _mm256_add_ps(sq_a0, sq_a1));
+            _mm256_storeu_ps(norm_b_lanes.as_mut_ptr(), _mm256_add_ps(sq_b0, sq_b1));
         }
         let (tail_d, tail_a, tail_b) = scalar::tail_dot_and_norms(a, b, i);
         (
@@ -431,7 +481,9 @@ mod tests {
 
     #[test]
     fn kernels_propagate_non_finite_values() {
-        let ones = [1.0_f32; 19];
+        // 37 elements: covers the unrolled bodies, the single-register loops
+        // and the scalar tails of every kernel.
+        let ones = [1.0_f32; 37];
         for position in 0..ones.len() {
             for poison in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
                 let mut poisoned = ones;
@@ -439,6 +491,12 @@ mod tests {
                 for kernel in Kernel::ALL {
                     if let Some(value) = dot_with(kernel, &poisoned, &ones) {
                         assert!(!value.is_finite(), "{kernel} hid {poison} at {position}");
+                    }
+                    if let Some((_, norm, _)) = dot_and_norms_with(kernel, &poisoned, &ones) {
+                        assert!(!norm.is_finite(), "{kernel} hid {poison} at {position}");
+                    }
+                    if let Some((_, _, norm)) = dot_and_norms_with(kernel, &ones, &poisoned) {
+                        assert!(!norm.is_finite(), "{kernel} hid {poison} at {position}");
                     }
                 }
             }

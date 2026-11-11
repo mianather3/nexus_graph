@@ -1,0 +1,33 @@
+services:
+  nexus-graph:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nexus_graph:local
+    command: ["serve", "--bind", "0.0.0.0:8080", "--snapshot-dir", "/data"]
+    ports:
+      # Loopback only: the API has no authentication. Put a gateway in front
+      # of it before exposing it beyond this host.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      # Per-namespace snapshots (<namespace>.ngsnap) survive restarts here.
+      - nexus-snapshots:/data
+    user: "10001:10001"
+    # The root filesystem is immutable; /data is the only writable path.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/nexus_graph", "healthcheck", "127.0.0.1:8080"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    stop_signal: SIGTERM
+    stop_grace_period: 35s
+    restart: unless-stopped
+
+volumes:
+  nexus-snapshots:

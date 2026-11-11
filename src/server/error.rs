@@ -170,6 +170,7 @@ impl From<NexusError> for ApiError {
             | NexusError::ZeroMagnitude
             | NexusError::InvalidConfig(_)
             | NexusError::EmptyQuery
+            | NexusError::InvalidDataset(_)
             | NexusError::DuplicateDocument(_)
             | NexusError::Graph(_) => Self::Unprocessable(error.to_string()),
             NexusError::Storage(_)

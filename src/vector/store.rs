@@ -64,6 +64,18 @@ impl VectorStore {
         self.ids.is_empty()
     }
 
+    /// Approximate heap bytes held by the store: the flat vector buffer, the
+    /// norms, the ids and the id-to-row map (estimated at its load factor).
+    pub fn memory_bytes(&self) -> usize {
+        use std::mem::size_of;
+        // hashbrown: one control byte per bucket plus the (key, value) slot.
+        let map_slot = size_of::<(EntityId, usize)>() + 1;
+        self.data.capacity() * size_of::<f32>()
+            + self.norms.capacity() * size_of::<f32>()
+            + self.ids.capacity() * size_of::<EntityId>()
+            + self.rows.capacity() * map_slot
+    }
+
     pub fn contains(&self, id: EntityId) -> bool {
         self.rows.contains_key(&id)
     }

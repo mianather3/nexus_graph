@@ -109,7 +109,7 @@ pub struct RetrievedEntity {
 }
 
 /// Result of a hybrid search: ranked hits plus their graph neighborhood.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RetrievalBundle {
     /// Fused hits, best first.
     pub hits: Vec<RetrievedEntity>,

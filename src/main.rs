@@ -9,7 +9,9 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,6 +19,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
+use nexus_graph::eval::{evaluate, EvalConfig, EvalDataset};
 use nexus_graph::server::dto::{EntityInput, RelationInput};
 use nexus_graph::server::{self, ServerConfig};
 use nexus_graph::{
@@ -43,6 +46,12 @@ USAGE:
         Hybrid vector + text search with rank fusion and graph expansion.
     nexus_graph serve --bind <addr> --snapshot-dir <path> [OPTIONS]
         Run the multi-tenant HTTP API (see SERVE OPTIONS).
+    nexus_graph eval --dataset <path> [--top-k <n>] [--hops <n>] [--json]
+        Score vector-only, BM25-only and hybrid retrieval against a
+        ground-truth dataset (MRR, Recall@K, context coverage, path recovery).
+    nexus_graph healthcheck [addr]
+        Probe GET /healthz of a running server [default: 127.0.0.1:8080].
+        Exits 0 if it answers 200, 1 otherwise.
 
 HYBRID OPTIONS (at least one of --text, --vector, --like is required):
     --text <query>          Text query for the BM25 channel
@@ -97,6 +106,9 @@ fn run(args: &[String]) -> Result<ExitCode> {
         ["search", snapshot, query, top_k] => search(snapshot, query, parse_value("top_k", top_k)?),
         ["hybrid", snapshot, options @ ..] => hybrid(snapshot, options),
         ["serve", options @ ..] => serve(options),
+        ["eval", options @ ..] => eval(options),
+        ["healthcheck"] => healthcheck("127.0.0.1:8080"),
+        ["healthcheck", addr] => healthcheck(addr),
         [] | ["help" | "--help" | "-h"] => {
             print!("{USAGE}");
             Ok(ExitCode::SUCCESS)
@@ -373,4 +385,73 @@ fn serve(options: &[&str]) -> Result<ExitCode> {
         .block_on(server::serve(bind, config))
         .with_context(|| format!("serving on {bind}"))?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn eval(options: &[&str]) -> Result<ExitCode> {
+    let mut dataset_path: Option<&str> = None;
+    let mut config = EvalConfig::default();
+    let mut json = false;
+
+    let mut remaining = options.iter().copied();
+    while let Some(flag) = remaining.next() {
+        if flag == "--json" {
+            json = true;
+            continue;
+        }
+        let value = remaining
+            .next()
+            .ok_or_else(|| anyhow!("missing value for `{flag}`"))?;
+        match flag {
+            "--dataset" => dataset_path = Some(value),
+            "--top-k" => config.top_k = parse_value(flag, value)?,
+            "--hops" => config.expansion_hops = parse_value(flag, value)?,
+            "--rrf-k" => config.rrf_k = parse_value(flag, value)?,
+            "--vector-weight" => config.vector_weight = parse_value(flag, value)?,
+            "--lexical-weight" => config.lexical_weight = parse_value(flag, value)?,
+            _ => bail!("unknown option `{flag}`\n\n{USAGE}"),
+        }
+    }
+    let path = dataset_path.ok_or_else(|| anyhow!("`eval` requires --dataset <path>"))?;
+    let text = fs::read_to_string(path).with_context(|| format!("reading `{path}`"))?;
+    let dataset: EvalDataset =
+        serde_json::from_str(&text).with_context(|| format!("parsing `{path}`"))?;
+
+    let report = evaluate(&dataset, &config)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("{report}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Minimal HTTP/1.1 probe, so that a container image without a shell or curl
+/// can still health-check itself.
+fn healthcheck(addr: &str) -> Result<ExitCode> {
+    let timeout = Duration::from_secs(2);
+    let socket = addr
+        .to_socket_addrs()
+        .with_context(|| format!("resolving `{addr}`"))?
+        .next()
+        .ok_or_else(|| anyhow!("`{addr}` resolves to no address"))?;
+    let mut stream = TcpStream::connect_timeout(&socket, timeout)
+        .with_context(|| format!("connecting to {socket}"))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    write!(
+        stream,
+        "GET /healthz HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut response = String::new();
+    stream
+        .take(4096)
+        .read_to_string(&mut response)
+        .context("reading the response")?;
+    let status_line = response.lines().next().unwrap_or_default();
+    if status_line.split_whitespace().nth(1) == Some("200") {
+        println!("healthy");
+        Ok(ExitCode::SUCCESS)
+    } else {
+        bail!("unhealthy: `{status_line}`")
+    }
 }

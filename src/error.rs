@@ -43,4 +43,6 @@ pub enum NexusError {
     InvalidConfig(&'static str),
     #[error("query has neither text nor an embedding")]
     EmptyQuery,
+    #[error("invalid evaluation dataset: {0}")]
+    InvalidDataset(String),
 }
